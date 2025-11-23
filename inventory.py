@@ -3,6 +3,8 @@
 
 import difflib
 import re
+import csv
+import os
 from typing import Dict, List, Tuple, Optional
 
 # ============================================================
@@ -11,6 +13,8 @@ from typing import Dict, List, Tuple, Optional
 
 def rec(box: Optional[str] = None, cover: bool = False) -> Dict[str, Optional[str] | bool]:
     return {"box": box, "cover": cover}
+
+MANUALS_CSV = "manuals.csv"
 
 # ---- Base catalog (everything you’ve listed so far with boxes) ----
 manuals: Dict[str, Dict[str, Optional[str] | bool]] = {
@@ -193,6 +197,65 @@ for title in cover_items:
             _lc_index = _lc_key_map(manuals)  # refresh for any further matches
 
 # ============================================================
+# CSV load/save + init
+# ============================================================
+
+def load_manuals_from_csv(path: str = MANUALS_CSV) -> Dict[str, Dict[str, Optional[str] | bool]]:
+    """Load manuals from a CSV file: columns title,box,cover."""
+    manuals_from_file: Dict[str, Dict[str, Optional[str] | bool]] = {}
+    if not os.path.exists(path):
+        return manuals_from_file
+
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            title = (row.get("title") or "").strip()
+            if not title:
+                continue
+            box_raw = (row.get("box") or "").strip()
+            box = box_raw or None
+            cover_raw = (row.get("cover") or "").strip().lower()
+            cover = cover_raw in ("1", "true", "yes", "y", "on")
+            manuals_from_file[title] = {"box": box, "cover": cover}
+    return manuals_from_file
+
+def save_manuals_to_csv(path: str = MANUALS_CSV) -> None:
+    """Save the current manuals dict to CSV."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["title", "box", "cover"])
+        for title in sorted(manuals.keys(), key=str.lower):
+            meta = manuals[title]
+            box = meta.get("box") or ""
+            cover = "1" if meta.get("cover") else "0"
+            writer.writerow([title, box, cover])
+
+def init_manuals() -> None:
+    """
+    Load manuals from CSV if it exists, otherwise:
+    - keep the hard-coded dictionaries
+    - export them into manuals.csv for future edits.
+    """
+    global manuals, _lc_index
+    from_csv = load_manuals_from_csv(MANUALS_CSV)
+    if from_csv:
+        manuals = from_csv
+    else:
+        # First run: export the in-code data to CSV
+        save_manuals_to_csv(MANUALS_CSV)
+    rebuild_lc_index()
+
+def remove_manual_by_title(title: str) -> bool:
+    """Remove a manual by its exact stored title and persist to CSV."""
+    global manuals
+    if title in manuals:
+        del manuals[title]
+        rebuild_lc_index()
+        save_manuals_to_csv(MANUALS_CSV)
+        return True
+    return False
+
+# ============================================================
 # Search engine (case-insensitive, smarter fuzzy + aligned tables)
 # ============================================================
 
@@ -329,6 +392,7 @@ def interactive():
     print("  list                — list all grouped by display box (BOX 1/2/3, COVER, UNKNOWN)")
     print("  list box 1|2|3      — list a specific box (aligned table)")
     print("  list cover          — list all items that have a cover")
+    print("  remove <text>       — remove an entry and update manuals.csv")
     print("  quit                — exit")
 
     while True:
@@ -347,6 +411,63 @@ def interactive():
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
 
+        # ---------- REMOVE ----------
+        if cmd in ("remove", "delete", "rm"):
+            if not arg:
+                print("Usage: remove <text>")
+                continue
+
+            # 1) Try exact lookup
+            res = exact_lookup(arg)
+            if res:
+                t, meta = res
+                confirm = input(f"Delete exact match '{t}' (box={meta['box']}, cover={meta['cover']})? [y/N]: ").strip().lower()
+                if confirm == "y":
+                    if remove_manual_by_title(t):
+                        print(f"Removed '{t}' and updated {MANUALS_CSV}.")
+                    else:
+                        print("Entry not found (unexpected).")
+                else:
+                    print("Cancelled.")
+                continue
+
+            # 2) Fuzzy matches
+            matches = smart_search(arg, top_n=5)
+            if not matches:
+                print("No close matches to remove.")
+                continue
+
+            print("Possible matches to delete:")
+            for idx, (t, meta, s) in enumerate(matches, start=1):
+                print(f"  {idx}. {t}  [box={meta['box']}, cover={meta['cover']}, score={s:.2f}]")
+
+            sel = input("Number to delete (blank to cancel): ").strip()
+            if not sel:
+                print("Cancelled.")
+                continue
+
+            try:
+                n = int(sel)
+            except ValueError:
+                print("Invalid selection.")
+                continue
+
+            if not (1 <= n <= len(matches)):
+                print("Selection out of range.")
+                continue
+
+            t, meta, _ = matches[n - 1]
+            confirm = input(f"Delete '{t}'? [y/N]: ").strip().lower()
+            if confirm == "y":
+                if remove_manual_by_title(t):
+                    print(f"Removed '{t}' and updated {MANUALS_CSV}.")
+                else:
+                    print("Entry not found (unexpected).")
+            else:
+                print("Cancelled.")
+            continue
+
+        # ---------- LIST ----------
         if cmd == "list":
             if arg.lower().startswith("box"):
                 box = arg.upper().strip()  # "BOX 1", "BOX 2", "BOX 3"
@@ -372,6 +493,7 @@ def interactive():
                     print_table(rows, show_score=False)
             continue
 
+        # ---------- EXACT ----------
         if cmd == "exact":
             if not arg:
                 print("Usage: exact <title>")
@@ -384,6 +506,7 @@ def interactive():
                 print("No exact (case-insensitive) match.")
             continue
 
+        # ---------- SEARCH ----------
         if cmd == "search":
             if not arg:
                 print("Usage: search <text>")
@@ -404,14 +527,16 @@ def interactive():
                 print("No close matches found.")
             continue
 
-        # Fallback: treat line as a search
+        # ---------- Fallback: treat line as a search ----------
         matches = smart_search(raw)
         if matches:
-            rows = [(t, meta["box"], bool(meta["cover"]), s) for (t, meta, s) in matches]
+            rows = [(t, meta["box"], bool(manuals[t]["cover"]), s) for (t, meta, s) in matches]
             print("Matches:")
             print_table(rows, show_score=True)
         else:
             print("No close matches found.")
 
 if __name__ == "__main__":
+    init_manuals()
     interactive()
+
